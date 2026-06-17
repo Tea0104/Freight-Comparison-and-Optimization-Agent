@@ -6,6 +6,7 @@
       :custom-label="userCredentials.label"
       :custom-subtitle="userCredentials.subtitle"
       @open-settings="settingsVisible = true"
+      @update:connection-status="handleConnectionStatus"
     />
 
     <AgentSettings
@@ -21,7 +22,12 @@
 
     <main class="workbench">
       <section class="left-rail">
-        <NLInput @parsed="handleNLParsed" @agent-update="handleAgentUpdate" :auth-headers="authHeaders" />
+        <NLInput
+          @parsed="handleNLParsed"
+          @agent-update="handleAgentUpdate"
+          :auth-headers="authHeaders"
+          :connection-status="connectionStatus"
+        />
 
         <div class="panel agent-panel">
           <div class="panel-header">
@@ -106,6 +112,8 @@
           :report="report"
           :exporting="exporting"
           :downloading-word="downloadingWord"
+          :connection-status="connectionStatus"
+          :agent-snapshot="agentSnapshot"
           @export="handleExport"
           @download-word="handleDownloadWord"
         />
@@ -144,6 +152,17 @@ import HistoryPanel from './components/HistoryPanel.vue'
 // ---- Agent 凭证管理 ----
 const AGENT_CREDENTIALS_KEY = 'agent_credentials'
 const settingsVisible = ref(false)
+
+// ---- 连接状态管理 ----
+const connectionStatus = ref({
+  online: navigator.onLine,
+  llm: false,
+  error: ''
+})
+
+const handleConnectionStatus = (status) => {
+  connectionStatus.value = status
+}
 
 const loadCredentials = () => {
   try {
@@ -456,13 +475,19 @@ const handleCompare = async () => {
 const handleExport = async () => {
   exporting.value = true
   try {
+    // 判断是否使用了AI助手
+    const useAI = connectionStatus.value.online &&
+                  connectionStatus.value.llm &&
+                  agentSnapshot.value?.parse_source !== 'offline_regex'
+
     const res = await axios.post('/api/export', {
       weight: form.value.weight,
       orig_port: form.value.orig_port,
       dest_port: form.value.dest_port,
       max_days: form.value.max_days || null,
       priority: form.value.priority || null,
-      feedback: agentSnapshot.value?.message || null
+      feedback: useAI ? (agentSnapshot.value?.message || null) : null,
+      use_ai: useAI
     })
     report.value = res.data.report
     ElMessage.success('报告生成成功')
@@ -476,13 +501,19 @@ const handleExport = async () => {
 const handleDownloadWord = async () => {
   downloadingWord.value = true
   try {
+    // 判断是否使用了AI助手
+    const useAI = connectionStatus.value.online &&
+                  connectionStatus.value.llm &&
+                  agentSnapshot.value?.parse_source !== 'offline_regex'
+
     const res = await axios.post('/api/export_docx', {
       weight: form.value.weight,
       orig_port: form.value.orig_port,
       dest_port: form.value.dest_port,
       max_days: form.value.max_days || null,
       priority: form.value.priority || null,
-      feedback: agentSnapshot.value?.message || null
+      feedback: useAI ? (agentSnapshot.value?.message || null) : null,
+      use_ai: useAI
     }, { responseType: 'blob' })
 
     const url = window.URL.createObjectURL(new Blob([res.data]))

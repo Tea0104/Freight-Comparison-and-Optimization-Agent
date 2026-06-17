@@ -17,6 +17,7 @@ from models import OrderRequest, ComparisonResult
 
 class DocxExportRequest(OrderRequest):
     feedback: Optional[str] = None
+    use_ai: Optional[bool] = True  # 是否使用了AI助手
 
 
 # 数据源实例（启动时初始化）
@@ -955,7 +956,7 @@ async def export_report(order: DocxExportRequest):
     """导出比价报告"""
     try:
         result = freight_service.compare(order)
-        report = generate_report(result, feedback=order.feedback)
+        report = generate_report(result, feedback=order.feedback, use_ai=order.use_ai)
         return {"report": report}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1037,12 +1038,19 @@ async def reload_datasource():
         return {"success": False, "data_source": active_data_source, "message": f"重新加载失败: {e}"}
 
 
-def generate_report(result: ComparisonResult, feedback: str = None) -> str:
+def generate_report(result: ComparisonResult, feedback: str = None, use_ai: bool = True) -> str:
     """生成比价报告文本"""
     lines = []
     lines.append("=" * 60)
     lines.append("运输方案比价报告")
     lines.append("=" * 60)
+
+    # 标注是否使用了AI助手
+    if not use_ai:
+        lines.append("")
+        lines.append("【未使用AI助手】")
+        lines.append("本报告由本地解析模式生成，未使用AI智能分析。")
+
     lines.append("")
     lines.append("【订单信息】")
     lines.append(f"  起运港: {result.order_info.orig_port}")
@@ -1064,7 +1072,8 @@ def generate_report(result: ComparisonResult, feedback: str = None) -> str:
             lines.append(f"{plan.carrier:<12} {mode_cn:<8} {service_cn:<8} {plan.transport_days:<6} ${plan.total_cost:<11.2f} {plan.cost_formula}")
 
     lines.append("")
-    if feedback:
+    # 只有使用了AI助手且有feedback时才显示AI推荐理由
+    if feedback and use_ai:
         lines.append("【AI 推荐理由】")
         lines.append(feedback)
         lines.append("")
@@ -1105,7 +1114,7 @@ def generate_report(result: ComparisonResult, feedback: str = None) -> str:
 # Word 文档导出
 # ================================================================
 
-def generate_docx(result: ComparisonResult, feedback: str = None) -> bytes:
+def generate_docx(result: ComparisonResult, feedback: str = None, use_ai: bool = True) -> bytes:
     """生成比价报告 Word 文档，返回 bytes"""
     from docx import Document
     from docx.shared import Inches, Pt, RGBColor
@@ -1118,6 +1127,14 @@ def generate_docx(result: ComparisonResult, feedback: str = None) -> bytes:
     # 标题
     title = doc.add_heading('运输方案比价报告', level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # 标注是否使用了AI助手
+    if not use_ai:
+        ai_notice = doc.add_paragraph()
+        ai_notice.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = ai_notice.add_run('【未使用AI助手】本报告由本地解析模式生成，未使用AI智能分析。')
+        run.font.color.rgb = RGBColor(0xc2, 0x41, 0x0c)
+        run.font.size = Pt(10)
 
     # 订单信息
     doc.add_heading('订单信息', level=1)
@@ -1164,8 +1181,8 @@ def generate_docx(result: ComparisonResult, feedback: str = None) -> bytes:
             row.cells[4].text = f'${plan.total_cost:.2f}'
             row.cells[5].text = f'{plan.score:.3f}'
 
-    # AI 反馈推荐（LLM 生成的推荐理由）
-    if feedback:
+    # AI 反馈推荐（LLM 生成的推荐理由）- 只有使用了AI且有feedback时才显示
+    if feedback and use_ai:
         doc.add_heading('AI 推荐理由', level=1)
         fb_para = doc.add_paragraph(feedback)
         fb_para.paragraph_format.space_after = Pt(12)
@@ -1342,7 +1359,7 @@ async def export_docx(order: DocxExportRequest):
     from urllib.parse import quote
     try:
         result = freight_service.compare(order)
-        docx_bytes = generate_docx(result, feedback=order.feedback)
+        docx_bytes = generate_docx(result, feedback=order.feedback, use_ai=order.use_ai)
         filename = f"比价报告_{order.orig_port}_{order.dest_port}_{order.weight}kg.docx"
         encoded = quote(filename)
         return Response(

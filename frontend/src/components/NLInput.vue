@@ -5,9 +5,25 @@
         <h3 class="card-title">Agent 需求输入</h3>
         <p class="card-desc">用一句话描述运输需求，系统会解析、追问并触发比价。</p>
       </div>
-      <el-tag v-if="parsing" type="primary" effect="plain">处理中</el-tag>
-      <el-tag v-else-if="sessionId" type="warning" effect="plain">等待补充</el-tag>
-      <el-tag v-else type="success" effect="plain">Agent 就绪</el-tag>
+      <div class="status-tags">
+        <el-tag v-if="!connectionStatus.online" type="danger" effect="dark">
+          ⚠ 网络未连接
+        </el-tag>
+        <el-tag v-else-if="!connectionStatus.llm" type="warning" effect="dark">
+          ⚠ LLM未连接
+        </el-tag>
+        <el-tag v-if="parsing" type="primary" effect="plain">处理中</el-tag>
+        <el-tag v-else-if="sessionId" type="warning" effect="plain">等待补充</el-tag>
+        <el-tag v-else-if="connectionStatus.online && connectionStatus.llm" type="success" effect="plain">Agent 就绪</el-tag>
+        <el-tag v-else type="info" effect="plain">本地解析模式</el-tag>
+      </div>
+    </div>
+
+    <!-- 离线模式提示 -->
+    <div v-if="!connectionStatus.online || !connectionStatus.llm" class="offline-notice">
+      <span class="offline-icon">⚡</span>
+      <span v-if="!connectionStatus.online">目前未有网络连接，已切换至本地解析模式（仅支持基本关键词识别）</span>
+      <span v-else>LLM未连接，已切换至本地解析模式（仅支持基本关键词识别）</span>
     </div>
 
     <div class="input-area">
@@ -136,12 +152,16 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 
 const props = defineProps({
   authHeaders: { type: Object, default: () => ({}) },
+  connectionStatus: {
+    type: Object,
+    default: () => ({ online: true, llm: false, error: '' })
+  },
 })
 
 const emit = defineEmits(['parsed', 'agent-update'])
@@ -157,6 +177,8 @@ const replyType = ref('')
 const agentMessage = ref('')
 const nextActions = ref([])
 const progressStage = ref(0)
+const isOfflineMode = ref(false)
+const offlineMessage = ref('')
 
 const progressStages = [
   { title: '理解运输需求', desc: '正在识别重量、港口方向和时效偏好。', percent: 24 },
@@ -195,6 +217,109 @@ const routeInvalid = computed(() => {
     parsedData.value.orig_port === parsedData.value.dest_port
 })
 
+// 检测是否应该使用离线模式
+const shouldUseOfflineMode = computed(() => {
+  return !props.connectionStatus.online || !props.connectionStatus.llm
+})
+
+// 离线模式下的简单解析（使用正则表达式）
+const parseOffline = (text) => {
+  const result = {
+    weight: null,
+    orig_port: null,
+    dest_port: null,
+    max_days: null,
+    priority: null
+  }
+
+  // 提取重量
+  const weightMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:kg|公斤|千克)/i)
+  if (weightMatch) {
+    result.weight = parseFloat(weightMatch[1])
+  }
+
+  const tonMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:吨|tons?)/i)
+  if (tonMatch) {
+    result.weight = parseFloat(tonMatch[1]) * 1000
+  }
+
+  // 港口名称映射
+  const portMap = {
+    '上海': 'PORT02', '深圳': 'PORT03', '广州': 'PORT04',
+    '宁波': 'PORT05', '青岛': 'PORT06', '天津': 'PORT07',
+    '大连': 'PORT08', '厦门': 'PORT09', '香港': 'PORT10',
+    '釜山': 'PORT11'
+  }
+
+  // 提取PORT代码
+  const portCodes = text.match(/PORT\s*(\d{1,2})/gi)
+  if (portCodes && portCodes.length >= 2) {
+    result.orig_port = portCodes[0].toUpperCase().replace(/\s/g, '')
+    result.dest_port = portCodes[1].toUpperCase().replace(/\s/g, '')
+  } else if (portCodes && portCodes.length === 1) {
+    // 根据方向词判断
+    if (/到|运到|发到/.test(text)) {
+      result.dest_port = portCodes[0].toUpperCase().replace(/\s/g, '')
+    } else {
+      result.orig_port = portCodes[0].toUpperCase().replace(/\s/g, '')
+    }
+  }
+
+  // 提取中文港口名
+  if (!result.orig_port || !result.dest_port) {
+    const routeMatch = text.match(/从\s*(\S+)\s*(?:.*?到)\s*(\S+)/)
+    if (routeMatch) {
+      const origName = routeMatch[1]
+      const destName = routeMatch[2]
+      for (const [name, code] of Object.entries(portMap)) {
+        if (origName.includes(name) && !result.orig_port) result.orig_port = code
+        if (destName.includes(name) && !result.dest_port) result.dest_port = code
+      }
+    }
+
+    // 单独匹配"到X"
+    if (!result.dest_port) {
+      const destMatch = text.match(/(?:运|发|送|寄)?到\s*(\S{2,})/)
+      if (destMatch) {
+        for (const [name, code] of Object.entries(portMap)) {
+          if (destMatch[1].includes(name)) {
+            result.dest_port = code
+            break
+          }
+        }
+      }
+    }
+
+    // 单独匹配"从X"
+    if (!result.orig_port) {
+      const origMatch = text.match(/从\s*(\S{2,})\s*(?:出发|发货|起运)?/)
+      if (origMatch) {
+        for (const [name, code] of Object.entries(portMap)) {
+          if (origMatch[1].includes(name)) {
+            result.orig_port = code
+            break
+          }
+        }
+      }
+    }
+  }
+
+  // 提取天数
+  const daysMatch = text.match(/(\d+)\s*(?:天|日)/)
+  if (daysMatch) {
+    result.max_days = parseInt(daysMatch[1])
+  }
+
+  // 识别优先级
+  if (/尽快|越快越好|加急|紧急|最快/.test(text)) {
+    result.priority = 'time'
+  } else if (/最省钱|越便宜越好|成本优先|最便宜|省钱/.test(text)) {
+    result.priority = 'cost'
+  }
+
+  return result
+}
+
 const handleParse = async () => {
   if (!inputText.value.trim()) {
     ElMessage.warning('请输入运输需求描述')
@@ -204,6 +329,9 @@ const handleParse = async () => {
   parsing.value = true
   errorMsg.value = ''
   progressStage.value = 0
+  isOfflineMode.value = false
+  offlineMessage.value = ''
+
   const userMsg = inputText.value.trim()
   emit('agent-update', {
     reply_type: 'processing',
@@ -219,6 +347,86 @@ const handleParse = async () => {
       progressStage.value += 1
     }
   }, 1400)
+
+  // 检测网络和LLM状态，决定是否使用离线模式
+  if (shouldUseOfflineMode.value) {
+    // 离线模式：使用正则解析
+    isOfflineMode.value = true
+    if (!props.connectionStatus.online) {
+      offlineMessage.value = '⚠ 目前未有网络连接，使用本地解析模式'
+    } else {
+      offlineMessage.value = '⚠ LLM未连接，使用本地解析模式'
+    }
+
+    // 模拟解析延迟
+    await new Promise(resolve => setTimeout(resolve, 500))
+
+    const offlineResult = parseOffline(userMsg)
+
+    // 计算缺失字段
+    const missing = []
+    if (!offlineResult.weight) missing.push('weight')
+    if (!offlineResult.orig_port) missing.push('orig_port')
+    if (!offlineResult.dest_port) missing.push('dest_port')
+
+    if (missing.length > 0) {
+      // 信息不完整
+      const fieldCn = { weight: '货物重量', orig_port: '起运港', dest_port: '目的港' }
+      const missingCn = missing.map(f => fieldCn[f] || f)
+
+      parsedData.value = offlineResult
+      missingFields.value = missing
+      replyType.value = 'clarification'
+      agentMessage.value = `已识别部分信息。还需要补充：${missingCn.join('、')}。`
+      nextActions.value = [`请提供${missingCn.join('、')}`]
+
+      emit('agent-update', {
+        reply_type: 'clarification',
+        intent: 'compare_freight',
+        missing_fields: missing,
+        order: offlineResult,
+        message: agentMessage.value,
+        parse_source: 'offline_regex',
+        feedback_source: null
+      })
+
+      ElMessage.warning(`信息不完整，缺少：${missingCn.join('、')}`)
+    } else {
+      // 信息完整
+      parsedData.value = offlineResult
+      missingFields.value = []
+      replyType.value = 'recommendation'
+      agentMessage.value = `已识别：${offlineResult.weight}kg，${offlineResult.orig_port} → ${offlineResult.dest_port}`
+      nextActions.value = []
+
+      if (offlineResult.priority === 'time') {
+        agentMessage.value += '（时效优先）'
+      } else if (offlineResult.priority === 'cost') {
+        agentMessage.value += '（成本优先）'
+      }
+
+      emit('parsed', offlineResult)
+      emit('agent-update', {
+        reply_type: 'recommendation',
+        intent: 'compare_freight',
+        missing_fields: [],
+        order: offlineResult,
+        message: agentMessage.value,
+        parse_source: 'offline_regex',
+        feedback_source: null
+      })
+
+      ElMessage.success('解析完成（本地模式）')
+    }
+
+    parsing.value = false
+    if (progressTimer) {
+      window.clearInterval(progressTimer)
+      progressTimer = null
+    }
+    inputText.value = ''
+    return
+  }
 
   try {
     const { data } = await axios.post('/api/agentic_chat', {
@@ -346,6 +554,30 @@ const resetSession = () => {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 14px;
+}
+
+.status-tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.offline-notice {
+  background: #fff7ed;
+  border: 1px solid #fdba74;
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #c2410c;
+}
+
+.offline-icon {
+  font-size: 16px;
 }
 
 .card-title {

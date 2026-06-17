@@ -7,23 +7,31 @@
     </div>
     <div
       class="header-badge"
-      :class="{ 'badge--custom': hasCustomAgent }"
+      :class="{
+        'badge--custom': hasCustomAgent,
+        'badge--disconnected': !isFullyConnected
+      }"
       @click="$emit('open-settings')"
+      :title="statusTip"
     >
       <span>{{ hasCustomAgent ? (customLabel || '自定义 Agent') : 'Agent v2' }}</span>
       <strong>{{ hasCustomAgent ? (customSubtitle || '自定义接入') : 'LLM + Rules' }}</strong>
       <div class="llm-status">
-        <span class="status-dot" :class="llmConnected ? 'connected' : 'disconnected'"></span>
-        <span class="status-text">{{ llmConnected ? 'LLM 已连接' : 'LLM 未连接' }}</span>
-        <span v-if="displayModel" class="status-model">{{ displayModel }}</span>
+        <span class="status-dot" :class="isFullyConnected ? 'connected' : 'disconnected'"></span>
+        <span class="status-text" :class="{ 'text-error': !isFullyConnected }">
+          {{ statusText }}
+        </span>
+        <span v-if="displayModel && isFullyConnected" class="status-model">{{ displayModel }}</span>
       </div>
-      <span class="badge-hint">{{ hasCustomAgent ? '点击修改配置' : '点击接入你的 Agent' }}</span>
+      <span v-if="!isOnline" class="badge-error">⚠ 目前未有网络连接</span>
+      <span v-else-if="!llmConnected" class="badge-error">⚠ LLM未连接</span>
+      <span v-else class="badge-hint">{{ hasCustomAgent ? '点击修改配置' : '点击接入你的 Agent' }}</span>
     </div>
   </header>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 
 const props = defineProps({
   hasCustomAgent: { type: Boolean, default: false },
@@ -32,30 +40,108 @@ const props = defineProps({
   customSubtitle: { type: String, default: '' },
 })
 
-defineEmits(['open-settings'])
+const emit = defineEmits(['open-settings', 'update:connection-status'])
 
 const llmConnected = ref(false)
+const isOnline = ref(navigator.onLine)
 const serverModel = ref('')
+const connectionError = ref('')
 
 const displayModel = computed(() => {
   if (props.hasCustomAgent && props.customModel) return props.customModel
   return serverModel.value || ''
 })
 
+// 综合连接状态：网络和LLM都连接才算已连接
+const isFullyConnected = computed(() => {
+  return isOnline.value && llmConnected.value
+})
+
+// 状态文本
+const statusText = computed(() => {
+  if (!isOnline.value) return '网络未连接'
+  if (!llmConnected.value) return 'LLM 未连接'
+  return 'LLM 已连接'
+})
+
+// 状态提示
+const statusTip = computed(() => {
+  if (!isOnline.value) return '目前未有网络连接，请检查网络设置'
+  if (!llmConnected.value) return 'LLM服务未配置或连接失败'
+  return ''
+})
+
 const checkStatus = async () => {
+  // 先检查网络状态
+  if (!navigator.onLine) {
+    isOnline.value = false
+    llmConnected.value = false
+    connectionError.value = '目前未有网络连接'
+    emit('update:connection-status', { online: false, llm: false, error: connectionError.value })
+    return
+  }
+
+  isOnline.value = true
+
   try {
-    const res = await fetch('/api/status')
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 5000) // 5秒超时
+
+    const res = await fetch('/api/status', {
+      signal: controller.signal
+    })
+    clearTimeout(timeoutId)
+
     const data = await res.json()
     llmConnected.value = data.llm_configured === true
     serverModel.value = data.llm_model || ''
-  } catch {
+    connectionError.value = ''
+  } catch (err) {
     llmConnected.value = false
     serverModel.value = ''
+    if (err.name === 'AbortError') {
+      connectionError.value = '连接超时'
+    } else {
+      connectionError.value = '无法连接到服务器'
+    }
   }
+
+  emit('update:connection-status', {
+    online: isOnline.value,
+    llm: llmConnected.value,
+    error: connectionError.value
+  })
 }
 
-onMounted(checkStatus)
-setInterval(checkStatus, 30000)
+// 监听网络状态变化
+const handleOnline = () => {
+  isOnline.value = true
+  checkStatus()
+}
+
+const handleOffline = () => {
+  isOnline.value = false
+  llmConnected.value = false
+  connectionError.value = '目前未有网络连接'
+  emit('update:connection-status', { online: false, llm: false, error: connectionError.value })
+}
+
+onMounted(() => {
+  checkStatus()
+  // 每30秒检测一次
+  const statusInterval = setInterval(checkStatus, 30000)
+
+  // 监听网络状态变化
+  window.addEventListener('online', handleOnline)
+  window.addEventListener('offline', handleOffline)
+
+  // 清理定时器
+  onUnmounted(() => {
+    clearInterval(statusInterval)
+    window.removeEventListener('online', handleOnline)
+    window.removeEventListener('offline', handleOffline)
+  })
+})
 </script>
 
 <style scoped>
@@ -114,6 +200,30 @@ setInterval(checkStatus, 30000)
 .header-badge.badge--custom {
   border-color: #0f766e;
   background: #f0fdfa;
+}
+
+.header-badge.badge--disconnected {
+  border-color: #ef4444;
+  background: #fef2f2;
+}
+
+.header-badge.badge--disconnected:hover {
+  border-color: #dc2626;
+  background: #fee2e2;
+  box-shadow: 0 2px 8px rgba(239, 68, 68, 0.1);
+}
+
+.text-error {
+  color: #ef4444 !important;
+  font-weight: 600;
+}
+
+.badge-error {
+  display: block !important;
+  font-size: 11px !important;
+  color: #ef4444;
+  margin-top: 4px;
+  margin-bottom: 0 !important;
 }
 
 .header-badge span {
