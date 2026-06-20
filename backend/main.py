@@ -316,40 +316,61 @@ async def upload_data(file: UploadFile = File(...)):
 
 @app.get("/api/data_preview")
 async def data_preview(page: int = 1, page_size: int = 50):
-    """分页浏览数据库中的运价数据（只读）"""
-    from database import get_engine
-    from sqlalchemy import text
+    """分页浏览运价数据（只读），CSV/SQLite 双模式兼容"""
+    columns = [
+        'id', 'carrier', 'orig_port', 'dest_port',
+        'min_weight', 'max_weight', 'service_level',
+        'min_cost', 'rate', 'mode', 'transport_days',
+        'carrier_type', 'service_rating'
+    ]
 
-    engine = get_engine()
     try:
-        with engine.connect() as conn:
-            # 总行数
-            total = conn.execute(text("SELECT COUNT(*) FROM freight_rates")).scalar()
+        if active_data_source == "sqlite":
+            from database import get_engine
+            from sqlalchemy import text
 
-            # 列名
-            columns = [
-                'id', 'carrier', 'orig_port', 'dest_port',
-                'min_weight', 'max_weight', 'service_level',
-                'min_cost', 'rate', 'mode', 'transport_days',
-                'carrier_type', 'service_rating'
-            ]
+            engine = get_engine()
+            with engine.connect() as conn:
+                total = conn.execute(text("SELECT COUNT(*) FROM freight_rates")).scalar()
+                offset = (page - 1) * page_size
+                rows = conn.execute(
+                    text(f"SELECT * FROM freight_rates LIMIT :limit OFFSET :offset"),
+                    {"limit": page_size, "offset": offset}
+                ).fetchall()
 
-            # 分页查询
+                row_list = []
+                for row in rows:
+                    row_dict = {}
+                    for i, col in enumerate(columns):
+                        val = row[i]
+                        if hasattr(val, '__float__'):
+                            val = float(val)
+                        row_dict[col] = val
+                    row_list.append(row_dict)
+        else:
+            # CSV 模式：从 DataFrame 做分页
+            df = freight_service.data_store.df
+            total = len(df)
             offset = (page - 1) * page_size
-            rows = conn.execute(
-                text(f"SELECT * FROM freight_rates LIMIT :limit OFFSET :offset"),
-                {"limit": page_size, "offset": offset}
-            ).fetchall()
+            page_df = df.iloc[offset:offset + page_size]
 
             row_list = []
-            for row in rows:
-                row_dict = {}
-                for i, col in enumerate(columns):
-                    val = row[i]
-                    if hasattr(val, '__float__'):
-                        val = float(val)
-                    row_dict[col] = val
-                row_list.append(row_dict)
+            for idx, row in page_df.iterrows():
+                row_list.append({
+                    'id': idx,
+                    'carrier': row.get('Carrier', ''),
+                    'orig_port': row.get('Orig_Port', ''),
+                    'dest_port': row.get('Dest_Port', ''),
+                    'min_weight': float(row.get('Min_Weight_Quant', 0)),
+                    'max_weight': float(row.get('Max_Weight_Quant', 0)),
+                    'service_level': row.get('Service_Level', ''),
+                    'min_cost': float(row.get('Min_Cost', 0)),
+                    'rate': float(row.get('Rate', 0)),
+                    'mode': row.get('Mode_DSC', ''),
+                    'transport_days': int(row.get('TPT_Day_Count', 0)),
+                    'carrier_type': row.get('Carrier_Type', ''),
+                    'service_rating': row.get('Service_Rating', 'C'),
+                })
 
         return {
             "total": total,
@@ -370,6 +391,7 @@ async def compare_freight(order: OrderRequest):
         return result
     except Exception as e:
         error_msg = str(e)
+        # 依赖 pydantic==2.5.2 错误消息格式, 升级版本需同步检查
         if "greater_than" in error_msg:
             raise HTTPException(status_code=400, detail="参数错误：货物重量必须大于0，请检查输入")
         elif "valid_ports" in error_msg or "PORT" in error_msg:
